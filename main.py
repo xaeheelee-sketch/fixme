@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # hook test 2026-05-10
 import argparse
 import json
 import sys
