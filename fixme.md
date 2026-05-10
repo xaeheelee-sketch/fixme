@@ -228,3 +228,6 @@ S3a/S3b 패치 적용 후 호출되는 공통 검증기. 다음을 순서대로 
 6. **토큰 예산**: 누적 토큰이 `per_run_token_budget`을 초과하면 신규 LLM 호출을 거부하고 잔여 vuln은 SKIP으로 마킹하세요.
 7. **테스트 가능성**: `BuildRunner`, `TestRunner`, `SanitizerRunner`, `MetisRunner`, `LLMClient`, `GitOps`를 의존성 주입 가능한 인터페이스로 분리하세요. 단위 테스트가 mock으로 전체 그래프를 실행할 수 있어야 합니다.
 8. **보수성**: S3a 결정론 fixer는 CWE별 모듈(`fixers/cwe_457.py` 등)로 분리해, 새 CWE 지원 추가가 LLM 코드 변경 없이 가능하도록 구성하세요.
+
+<!-- hook 동작 테스트 -->
+
