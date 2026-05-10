@@ -1,0 +1,48 @@
+run_id: auto
+api_base: http://internal-llm-gateway/v1
+api_key_env: INTERNAL_LLM_API_KEY
+
+scope:
+  enabled_cwes:
+    - CWE-457
+    - CWE-476
+    - CWE-401
+    - CWE-563
+    - CWE-120
+    - CWE-787
+    - CWE-190
+    - CWE-369
+    - CWE-415
+    - CWE-416
+  min_severity: Medium
+  path_allowlist:
+    - "src/**"
+    - "lib/**"
+  path_blocklist:
+    - "third_party/**"
+    - "vendor/**"
+    - "**/*generated*"
+  safety_critical_paths:
+    - "src/safety/**"
+
+models:
+  triage: qwen3.6-27b-fp8
+  fixer: gtp-oss-120b
+  analyzer: qwen3.6-27b-fp8
+
+limits:
+  max_retries: 3
+  max_diff_lines: 30
+  per_run_token_budget: 5000000
+
+runners:
+  build_cmd: "make -j"
+  test_cmd: "ctest --output-on-failure"
+  sanitizer_cmd: "make CFLAGS='-fsanitize=address,undefined -g' -j"
+  metis_cmd: "metis scan --json"
+  sanitizer_enabled: true
+
+paths:
+  whitelist_rules: "config/whitelist_rules.yaml"
+  feedback_db: "feedback/decisions.jsonl"
+  output_dir: "out"
