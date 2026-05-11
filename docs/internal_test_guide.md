@@ -34,20 +34,175 @@ export LANGCHAIN_TELEMETRY=false
 
 ---
 
-## 단계 0 — 환경 준비
+## 단계 0 — 첫 실행 환경 준비
+
+### 0-1. 디렉토리 / Python 버전
+
+이하 모든 명령은 **프로젝트 루트** (`config.yaml`, `main.py`, `fixme/`가 같이 있는 디렉토리)에서 실행한다.
+
+```
+프로젝트루트/
+├── config.yaml             ← 편집 대상
+├── main.py                 ← 진입점
+├── requirements.txt
+├── requirements-dev.txt
+├── fixme/                  ← 패키지 본체
+├── scripts/                ← check_llm.py, smoke_triage.py
+├── tests/                  ← pytest 대상
+└── docs/                   ← 이 문서
+```
+
+**Python 요건**: 3.10 이상 (langchain-openai/langgraph 요구사항).
+```bash
+python --version    # Python 3.10.x 이상이어야 함
+```
+
+### 0-2. 가상환경 + 의존성 설치
+
+프로젝트 루트에서:
 
 ```bash
-# 1. 의존성 설치 (사내 PyPI 미러를 사용한다면 --index-url 옵션 추가)
+# Windows (cmd / PowerShell)
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-pip install -r requirements-dev.txt    # pytest
+pip install -r requirements-dev.txt
 
-# 2. 환경변수
-export INTERNAL_LLM_API_KEY=<게이트웨이 키>
-# 위 텔레메트리 차단 4종
-
-# 3. config.yaml 의 api_base 가 실제 게이트웨이 주소인지 확인
-grep api_base config.yaml
+# Linux / macOS / WSL
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
+
+설치되는 것:
+- `requirements.txt` → `langchain`, `langchain-openai`, `langgraph`, `pydantic`, `pyyaml` (런타임)
+- `requirements-dev.txt` → `pytest` (테스트용)
+
+**사내 PyPI 미러를 쓴다면** 매번 `--index-url <사내미러>`을 붙이거나 `pip.ini`/`pip.conf` 에 박는다.
+
+### 0-3. LLM 설정 — `config.yaml` 한 파일에서 끝
+
+별도의 LLM 설정 파일은 **없다**. 모든 LLM 관련 설정은 `config.yaml` 상단 + `models:` 블록 두 군데에 있다. 첫 실행 전 다음 **세 군데**를 사내 환경에 맞게 수정한다.
+
+`config.yaml` (현재 상태):
+```yaml
+run_id: auto
+api_base: http://internal-llm-gateway/v1   # ① 게이트웨이 주소 — 실제 값으로 교체
+api_key_env: INTERNAL_LLM_API_KEY          # ② 키를 담을 환경변수 이름 (기본값 그대로 둬도 됨)
+
+# ...
+
+models:                                      # ③ 모델 ID — 사내 게이트웨이가 실제로 노출하는 이름으로 교체
+  triage:   qwen3.6-27b-fp8
+  fixer:    gtp-oss-120b
+  analyzer: qwen3.6-27b-fp8
+```
+
+확인 방법:
+- ① `api_base`: 사내 게이트웨이의 OpenAI 호환 베이스 URL. 보통 `/v1` 까지 포함. 예: `https://llm.intra.company.com/v1`
+- ② `api_key_env`: 환경변수 **이름**(값 아님). 코드는 이 이름으로 `os.environ.get(...)` 한다. 키 자체는 셸에 export로 주입.
+- ③ `models.{triage,fixer,analyzer}`: 게이트웨이의 모델 카탈로그(`/v1/models`)에서 확인한 정확한 ID. 셋 다 같은 모델로 시작해도 무방.
+
+### 0-4. 환경변수 설정
+
+```bash
+# Windows cmd
+set INTERNAL_LLM_API_KEY=<게이트웨이가_발급한_키>
+set LANGCHAIN_TRACING_V2=false
+set LANGSMITH_TRACING=false
+set LANGCHAIN_TELEMETRY=false
+
+# PowerShell
+$env:INTERNAL_LLM_API_KEY = "<키>"
+$env:LANGCHAIN_TRACING_V2 = "false"
+$env:LANGSMITH_TRACING    = "false"
+$env:LANGCHAIN_TELEMETRY  = "false"
+
+# bash / zsh
+export INTERNAL_LLM_API_KEY=<키>
+export LANGCHAIN_TRACING_V2=false
+export LANGSMITH_TRACING=false
+export LANGCHAIN_TELEMETRY=false
+```
+
+단계 1(pytest)은 환경변수 없어도 통과한다. **단계 2부터 `INTERNAL_LLM_API_KEY` 필요.**
+
+세션 종료 시 환경변수가 사라지므로 영구 적용하려면 OS 사용자 환경변수에 등록하거나 셸 프로필(`~/.bashrc`, PowerShell `$PROFILE`)에 박는다.
+
+### 0-5. 사내망 SSL/프록시
+
+게이트웨이가 `https://`이고 사내 CA 인증서를 쓴다면:
+
+```bash
+# bash
+export SSL_CERT_FILE=/path/to/corp-ca-bundle.pem
+export REQUESTS_CA_BUNDLE=/path/to/corp-ca-bundle.pem
+
+# Windows
+set SSL_CERT_FILE=C:\path\to\corp-ca-bundle.pem
+set REQUESTS_CA_BUNDLE=C:\path\to\corp-ca-bundle.pem
+```
+
+게이트웨이가 `http://`면 SSL 무관(현재 기본값이 그러함).
+
+HTTP/HTTPS 프록시가 필요하면 `HTTPS_PROXY`/`HTTP_PROXY` 표준 환경변수를 사용한다. **사내 게이트웨이는 보통 NO_PROXY** 에 추가해야 직접 통신:
+```bash
+export HTTPS_PROXY=http://corp-proxy:8080
+export NO_PROXY=llm.intra.company.com,localhost,127.0.0.1
+```
+
+### 0-6. 첫 실행 quick-start (5분)
+
+여기까지 끝내고 다음 3개를 순서대로 통과하면 환경 준비 완료:
+
+```bash
+# (1) 단위 테스트 — LLM 불필요. 가장 먼저.
+pytest -q
+
+# (2) LLM 게이트웨이 연결 — 1 호출
+python scripts/check_llm.py --config config.yaml
+
+# (3) 단일 vuln triage — 1 호출, 코드 베이스/Metis 입력 불필요
+python scripts/smoke_triage.py --config config.yaml
+```
+
+위 셋 다 통과하면 **단계 3(전처리)** 부터 본 작업으로 진입.
+
+### 0-7. 선택 사항 — 미리 만들어 둘 파일
+
+다음 파일들은 코드가 없으면 가만히 빈값으로 처리하므로, 첫 실행에서 **반드시 만들 필요는 없다**. 운영 단계에서 필요해질 때 만든다.
+
+| 경로 | 역할 | 형식 |
+|---|---|---|
+| `config/whitelist_rules.yaml` | rule-based 화이트리스트 (S1) | 리스트 of `{file_name, cwe, snippet_contains}` |
+| `feedback/decisions.jsonl` | 과거 PR 리뷰 결과 (S6 → S1/S3b) | 라인당 1 JSON, `{vuln_signature, file, ..., decision}` |
+
+### 0-8. Metis JSON 입력 형식 참고
+
+`--metis-input` 으로 넘기는 JSON은 다음 구조를 기대한다 (Metis CLI `--json` 출력 그대로 호환):
+
+```json
+{
+  "reviews": [
+    {
+      "file_path": "src/foo.c",
+      "findings": [
+        {
+          "id": "metis-001",
+          "line_number": 42,
+          "cwe": "CWE-476",
+          "severity": "High",
+          "code_snippet": "ptr->field = 1;",
+          "description": "Possible null pointer dereference."
+        }
+      ]
+    }
+  ]
+}
+```
+
+단계 3(`--stage preprocess`)부터 이 입력이 필요하다. 단계 0~2는 입력 없이 진행 가능.
 
 ---
 
