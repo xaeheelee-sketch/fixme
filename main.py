@@ -19,10 +19,14 @@ from fixme.preprocessing import parse_and_filter_vulnerabilities, group_by_file
 from fixme.runners import (
     SubprocessRunner, CmdBuildRunner, CmdTestRunner, CmdSanitizerRunner,
     CmdMetisRunner, CliGitOps,
+    NoopBuildRunner, NoopTestRunner, NoopSanitizerRunner, NoopMetisRunner,
 )
 from fixme.tracer import JsonlTracer
 from fixme.triage import Triager
 from fixme.verification import Verifier
+
+
+STAGES = ["preprocess", "triage", "deterministic", "llm-fix", "full"]
 
 
 def main() -> int:
@@ -30,6 +34,25 @@ def main() -> int:
     parser.add_argument("--config", required=True, help="Path to config.yaml")
     parser.add_argument("--metis-input", required=True, help="Metis JSON file")
     parser.add_argument("--repo-root", required=True, help="Target repository root")
+    parser.add_argument(
+        "--stage", choices=STAGES, default="full",
+        help=(
+            "Pipeline gate. preprocess: S1 only (no LLM). triage: S1+S2. "
+            "deterministic: S1+S2+S3a (LLM-fix/explain skipped). "
+            "llm-fix: S1+S2+S3a+S3b (explain-only skipped). full: everything."
+        ),
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="Process only the first N findings (after preprocessing). 0 = no limit.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "Replace build/test/sanitizer/Metis runners with noops. "
+            "Patch apply, safety scan, and git commit still execute."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -37,42 +60,71 @@ def main() -> int:
     metis_json = json.loads(Path(args.metis_input).read_text(encoding="utf-8"))
 
     tracer = JsonlTracer(config.output_run_dir / "trace.jsonl")
+    tracer.log("run_start", stage=args.stage, limit=args.limit, dry_run=args.dry_run)
     budget = TokenBudget(config.limits.per_run_token_budget)
     feedback = FeedbackDB(Path(config.paths.feedback_db))
 
     cmd_runner = SubprocessRunner()
     git_ops = CliGitOps(cmd_runner)
-    build = CmdBuildRunner(config.runners.build_cmd, cmd_runner)
-    test = CmdTestRunner(config.runners.test_cmd, cmd_runner)
-    sanitizer = (
-        CmdSanitizerRunner(config.runners.sanitizer_cmd, config.runners.test_cmd, cmd_runner)
-        if config.runners.sanitizer_enabled and config.runners.sanitizer_cmd
-        else None
-    )
-    metis_runner = CmdMetisRunner(config.runners.metis_cmd, cmd_runner)
-    verifier = Verifier(build, test, sanitizer, metis_runner, repo_root)
 
-    triager = Triager(config, budget, tracer)
-    llm_fixer = LlmFixer(config, budget, tracer, verifier, git_ops, repo_root)
-    explainer = Explainer(config, budget, tracer)
-    applier = PatchApplier(config, git_ops, verifier, repo_root)
+    if args.dry_run:
+        build = NoopBuildRunner()
+        test = NoopTestRunner()
+        sanitizer: object | None = NoopSanitizerRunner()
+        metis_runner = NoopMetisRunner()
+    else:
+        build = CmdBuildRunner(config.runners.build_cmd, cmd_runner)
+        test = CmdTestRunner(config.runners.test_cmd, cmd_runner)
+        sanitizer = (
+            CmdSanitizerRunner(config.runners.sanitizer_cmd, config.runners.test_cmd, cmd_runner)
+            if config.runners.sanitizer_enabled and config.runners.sanitizer_cmd
+            else None
+        )
+        metis_runner = CmdMetisRunner(config.runners.metis_cmd, cmd_runner)
+
+    verifier = Verifier(build, test, sanitizer, metis_runner, repo_root)  # type: ignore[arg-type]
     writer = OutputWriter(config)
-
-    branch = f"metis-autofix/{config.run_id}"
-    try:
-        git_ops.create_branch(repo_root, branch)
-    except Exception as exc:
-        tracer.log("branch_create_failed", error=str(exc))
 
     vulns = parse_and_filter_vulnerabilities(metis_json, config, feedback, repo_root)
     grouped = group_by_file(vulns)
     tracer.log("preprocessing_done", total=len(vulns), files=len(grouped))
+    print(f"[preprocess] {len(vulns)} findings in scope across {len(grouped)} files")
+
+    if args.stage == "preprocess":
+        _write_preprocess_dump(writer, vulns)
+        writer.finalize()
+        tracer.log("run_complete", stage="preprocess")
+        print(f"[done] preprocess output: {writer.run_dir}/preprocessed.json")
+        return 0
+
+    if args.limit > 0:
+        flat = [v for vs in grouped.values() for v in vs][: args.limit]
+        grouped = group_by_file(flat)
+        print(f"[limit] processing first {len(flat)} findings only")
+
+    triager = Triager(config, budget, tracer)
+
+    needs_fix_pipeline = args.stage in ("deterministic", "llm-fix", "full")
+    llm_fixer = (
+        LlmFixer(config, budget, tracer, verifier, git_ops, repo_root)
+        if args.stage in ("llm-fix", "full") else None
+    )
+    explainer = Explainer(config, budget, tracer) if args.stage == "full" else None
+    applier = PatchApplier(config, git_ops, verifier, repo_root) if needs_fix_pipeline else None
+
+    if needs_fix_pipeline:
+        branch = f"metis-autofix/{config.run_id}"
+        try:
+            git_ops.create_branch(repo_root, branch)
+        except Exception as exc:
+            tracer.log("branch_create_failed", error=str(exc))
 
     for _file_path, file_vulns in grouped.items():
         for vuln in file_vulns:
             try:
                 _process_vuln(
-                    vuln, repo_root, config, triager, llm_fixer, explainer, applier,
+                    vuln, repo_root, config, args.stage,
+                    triager, llm_fixer, explainer, applier,
                     writer, tracer, feedback,
                 )
             except BudgetExceeded as exc:
@@ -91,18 +143,32 @@ def main() -> int:
                 ))
 
     writer.finalize()
-    tracer.log("run_complete", run_id=config.run_id)
+    tracer.log("run_complete", stage=args.stage, run_id=config.run_id)
+    print(f"[done] stage={args.stage} output: {writer.run_dir}")
     return 0
+
+
+def _write_preprocess_dump(writer: OutputWriter, vulns: list[VulnRecord]) -> None:
+    path = writer.run_dir / "preprocessed.json"
+    data = {
+        "count": len(vulns),
+        "findings": [v.model_dump() for v in vulns],
+    }
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
 
 
 def _process_vuln(
     vuln: VulnRecord,
     repo_root: Path,
     config: Config,
+    stage: str,
     triager: Triager,
-    llm_fixer: LlmFixer,
-    explainer: Explainer,
-    applier: PatchApplier,
+    llm_fixer: LlmFixer | None,
+    explainer: Explainer | None,
+    applier: PatchApplier | None,
     writer: OutputWriter,
     tracer: JsonlTracer,
     feedback: FeedbackDB,
@@ -125,6 +191,13 @@ def _process_vuln(
         triage_label=decision.label,
     )
 
+    if stage == "triage":
+        item.strategy = decision.suggested_strategy
+        item.final_status = f"TRIAGED_{route}"
+        item.latency_ms = int((time.time() - t0) * 1000)
+        writer.add_report_item(item)
+        return
+
     if route == "SKIP":
         item.strategy = "SKIP"
         item.final_status = "SKIPPED"
@@ -139,6 +212,11 @@ def _process_vuln(
         return
 
     if route == "EXPLAIN_ONLY":
+        if explainer is None:
+            item.strategy = "EXPLAIN_ONLY"
+            item.final_status = "SKIPPED_STAGE"
+            writer.add_report_item(item)
+            return
         exp = explainer.explain(vuln, ctx)
         writer.write_explanation(vuln, exp)
         item.strategy = "EXPLAIN_ONLY"
@@ -148,6 +226,7 @@ def _process_vuln(
         return
 
     if route == "DETERMINISTIC":
+        assert applier is not None
         succeeded = _try_deterministic(vuln, src, applier, writer, tracer)
         if succeeded:
             item.strategy = "DETERMINISTIC"
@@ -158,6 +237,12 @@ def _process_vuln(
             return
         tracer.log("deterministic_escalate", vuln_id=vuln.vuln_id)
 
+    # LLM_FIX path (or escalated from DETERMINISTIC)
+    if llm_fixer is None:
+        item.strategy = "LLM_FIX"
+        item.final_status = "SKIPPED_STAGE"
+        writer.add_report_item(item)
+        return
     _run_llm_fix(vuln, ctx, llm_fixer, writer, feedback, item, t0)
 
 

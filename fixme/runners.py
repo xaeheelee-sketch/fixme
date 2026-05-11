@@ -109,6 +109,35 @@ class CmdMetisRunner(MetisRunner):
         return _json.loads(result.stdout)
 
 
+class NoopBuildRunner(BuildRunner):
+    """Always-success build runner for dry-run / step-only execution.
+
+    Used when the test environment cannot run the real build (no toolchain,
+    closed network without compiler, etc.) but we still want to exercise S1/S2/S3
+    code paths.
+    """
+
+    def build(self, cwd: Path) -> CommandResult:
+        return CommandResult(0, "noop build OK", "")
+
+
+class NoopTestRunner(TestRunner):
+    def test(self, cwd: Path) -> CommandResult:
+        return CommandResult(0, "noop test OK", "")
+
+
+class NoopSanitizerRunner(SanitizerRunner):
+    def build_and_test(self, cwd: Path) -> CommandResult:
+        return CommandResult(0, "noop sanitizer OK", "")
+
+
+class NoopMetisRunner(MetisRunner):
+    """Returns an empty Metis report so verifier sees 'no remaining findings'."""
+
+    def scan(self, cwd: Path, files: list[str] | None = None) -> dict:
+        return {"reviews": []}
+
+
 class CliGitOps(GitOps):
     def __init__(self, runner: CommandRunner):
         self.runner = runner
