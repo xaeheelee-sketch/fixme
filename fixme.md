@@ -40,7 +40,29 @@ Metis JSON
 
 ```yaml
 scope:
-  enabled_cwes: [CWE-457, CWE-476, CWE-401, CWE-563, CWE-120, CWE-787, CWE-190, CWE-369, CWE-415, CWE-416]
+  # 자동/LLM 수정 시도 대상 CWE
+  enabled_cwes:
+    # 결정론 fixer 또는 LLM 수정 후보 (S3a / S3b 라우팅)
+    - CWE-457   # Uninitialized variable (S3a)
+    - CWE-476   # Null pointer dereference (S3a 다수, 복잡건 S3b) — Top1, 171건
+    - CWE-401   # Memory leak (S3a 단순건)
+    - CWE-563   # Unused variable (S3a)
+    - CWE-120   # Buffer copy without size check
+    - CWE-787   # Out-of-bounds Write (S3b)
+    - CWE-119   # Buffer bounds 일반 (S3b) — Top4, 70건
+    - CWE-125   # Out-of-bounds Read (S3b) — Top6, 31건
+    - CWE-190   # Integer overflow (S3a 단순건)
+    - CWE-369   # Divide by zero
+    - CWE-415   # Double free
+    - CWE-416   # Use after free
+    - CWE-20    # Improper input validation (S3b, NULL/길이 체크 추가 위주) — Top2, 74건
+  # scope에는 포함하되 자동수정은 시도하지 않고 무조건 Explain-only(S3c)로만 처리하는 CWE.
+  # 이유: 설계 변경/아키텍처/프로토콜 레벨 결정이 필요해 자동수정이 위험하지만, 리뷰어 트리아지에 설명문서가 가치 있음.
+  explain_only_cwes:
+    - CWE-284   # Improper access control
+    - CWE-327   # Broken/risky crypto
+    - CWE-22    # Path traversal
+    - CWE-319   # Cleartext transmission
   min_severity: Medium
   path_allowlist: ["src/**", "lib/**"]
   path_blocklist: ["third_party/**", "vendor/**", "**/*generated*"]
@@ -66,15 +88,16 @@ runners:
 함수: `parse_and_filter_vulnerabilities(raw_json, config, feedback_db) -> list[dict]`
 
 순서대로 적용:
-1. **Scope 필터**: `enabled_cwes`, `min_severity`, `path_allow/blocklist`
-2. **Rule-based Whitelist**: `[{"file_name": "mkdep.c", "cwe": "CWE-120", "snippet_contains": "memcpy(depname"}]` 형태 규칙
-3. **Inline Comment Whitelist**:
+1. **Scope 필터**: `enabled_cwes ∪ explain_only_cwes`, `min_severity`, `path_allow/blocklist`. 두 집합 모두 scope 안.
+2. **Scope-out 카운팅**: scope에서 제외된 finding 수를 CWE별로 집계해 `report.json.scope_out`에 보존(운영자가 "의도적 제외" 인지 가능하도록).
+3. **Rule-based Whitelist**: `[{"file_name": "mkdep.c", "cwe": "CWE-120", "snippet_contains": "memcpy(depname"}]` 형태 규칙
+4. **Inline Comment Whitelist**:
    - `// metis-ignore: CWE-XXX` (해당 라인)
    - `// metis-ignore-next-line: CWE-XXX`
    - `// metis-ignore-begin: CWE-XXX` ~ `// metis-ignore-end` (블록)
    - 다중 CWE: `metis-ignore: CWE-120,CWE-787`
-4. **Past-rejection lookup**: `feedback_db`에서 이전에 reject된 동일 (file, line range, CWE) 튜플 제외
-5. **파일 단위 그룹핑**: 동일 파일은 순차 처리하도록 묶음 반환
+5. **Past-rejection lookup**: `feedback_db`에서 이전에 reject된 동일 (file, line range, CWE) 튜플 제외
+6. **파일 단위 그룹핑**: 동일 파일은 순차 처리하도록 묶음 반환
 
 처리 시작 전 git 베이스 SHA를 기록하고, 작업 브랜치 `metis-autofix/<run_id>`를 생성합니다.
 
@@ -91,12 +114,14 @@ class TriageDecision(BaseModel):
     suggested_strategy: Literal["DETERMINISTIC", "LLM_FIX", "EXPLAIN_ONLY", "SKIP"]
 ```
 
-라우팅 규칙:
-- `TP_SIMPLE` + CWE가 결정론 fixer 지원 → **S3a**
-- `TP_SIMPLE` + 미지원 CWE → **S3b** (`confidence >= 0.6`일 때만)
-- `TP_DESIGN` 또는 `safety_critical_paths` 매칭 → **S3c (Explain-only)**
-- `FALSE_POSITIVE` → 화이트리스트 후보 큐에 적재(사람 승인 후 등록)
-- `OUT_OF_SCOPE` 또는 `confidence < 0.6` → 스킵 + 로그
+라우팅 규칙(우선순위 순서대로 평가, 먼저 매칭되는 규칙 적용):
+1. **CWE가 `explain_only_cwes`에 속함** → **S3c (Explain-only) 강제**. triage label/strategy 무시. 자동수정 시도 금지.
+2. `safety_critical_paths` 매칭 → **S3c (Explain-only) 강제**.
+3. `TP_SIMPLE` + CWE가 결정론 fixer 지원 → **S3a**
+4. `TP_SIMPLE` + 미지원 CWE → **S3b** (`confidence >= 0.6`일 때만)
+5. `TP_DESIGN` → **S3c (Explain-only)**
+6. `FALSE_POSITIVE` → 화이트리스트 후보 큐에 적재(사람 승인 후 등록)
+7. `OUT_OF_SCOPE` 또는 `confidence < 0.6` → 스킵 + 로그
 
 ## S3. Apply (3 Sub-flows)
 
@@ -104,13 +129,15 @@ class TriageDecision(BaseModel):
 CWE별 파이썬 함수 레지스트리. 각 함수는 `(vuln, source) -> Optional[Patch]`.
 
 초기 지원 대상(확장 가능):
+- `CWE-476` (단순 null deref): 사용 직전 null check 삽입 — **최우선 구현 대상**. 실데이터에서 가장 큰 비중(Top1)이라 정확도가 시스템 ROI를 좌우함. 다음 패턴 우선 처리: ① 단일 인자 deref (`p->x`, `*p`) 직전 `if (!p) return <err>;`, ② 함수 진입부 파라미터 NULL guard 추가.
 - `CWE-457` (Uninitialized variable): 선언부에 `= 0` / `= NULL` / `= {0}` 삽입
-- `CWE-476` (단순 null deref): 사용 직전 null check 삽입
 - `CWE-563` (Unused variable): 선언 제거 또는 `(void)var;`
 - `CWE-401` (Memory leak, 단순 케이스): 매칭되는 `free()`를 에러 경로에 삽입
 - `CWE-190` (단순 정수 오버플로우): `size_t` 타입 캐스팅, `SIZE_MAX` 체크 삽입
 
 각 fixer는 **AST 또는 정밀 정규식** 기반이며, 한 fix당 변경 라인을 5줄 이내로 제한합니다. 매칭 실패 시 즉시 S3b로 강등(escalate).
+
+> **현실적 처리율 가이드**: 660건 규모 입력 기준, S3a로 자동수정 가능한 비율은 ~15~20%(주로 CWE-476/190 단순건). 나머지는 S3b LLM 시도(성공률 30~50%) 또는 S3c Explain-only로 분배되는 게 정상. "전체 cover" 가 목표가 아님.
 
 ### S3b. LLM Fixer with Self-Healing Loop (LangGraph)
 
@@ -196,11 +223,14 @@ S3a/S3b 패치 적용 후 호출되는 공통 검증기. 다음을 순서대로 
 어떤 fix도 main 브랜치에 직접 반영하지 않습니다.
 
 - 작업 브랜치 `metis-autofix/<run_id>`에 vuln 단위 커밋 누적
-- `out/<run_id>/report.json`: 각 vuln의 (id, CWE, severity, triage_label, strategy, attempts, final_status, diff_path, tokens, latency, cost_estimate)
+- `out/<run_id>/report.json`:
+  - `findings`: 각 vuln의 (id, CWE, severity, triage_label, strategy, attempts, final_status, diff_path, tokens, latency, cost_estimate)
+  - `scope_out`: S1에서 scope 필터로 제외된 finding 수를 CWE별 집계 (`{"CWE-XXX": N, ...}`). "의도적으로 안 본" finding 가시화 목적.
+  - `totals`: 전체 입력 N / scope-in / 자동수정 성공 / LLM 시도 / Explain-only / FP 후보 / 스킵
 - `out/<run_id>/patches/*.patch`: 개별 unified diff
 - `out/<run_id>/explanations/*.md`: S3c 산출물
 - `out/<run_id>/whitelist_candidates.json`: S2에서 `FALSE_POSITIVE`로 분류된 항목들 (사람 승인 후 화이트리스트 등록 대상)
-- `out/<run_id>/summary.md`: 사람이 1분 내 훑을 수 있는 요약(전체 N건 / 성공 / 실패 / Explain / FP 후보)
+- `out/<run_id>/summary.md`: 사람이 1분 내 훑을 수 있는 요약(전체 N건 / scope-out N건 / 성공 / 실패 / Explain / FP 후보)
 
 리뷰어는 브랜치를 PR로 올리고, 커밋 단위로 cherry-pick하여 main에 반영합니다.
 
